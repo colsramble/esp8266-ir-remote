@@ -1,5 +1,6 @@
 #include <ESP8266WiFi.h>
 #include "sampler.h"
+#include <FS.h>
 
 //////////////////////
 // WiFi Definitions //
@@ -27,9 +28,11 @@ const int ANALOG_PIN    = A0;
 #define BUF_SIZE  2500     // IR Buffer size in Bytes (1 Byte = 800uS, 
 #define SAMPLE_PERIOD  100
 
-byte irbuffer[BUF_SIZE];
+#define DBG_OUTPUT_PORT Serial
+#define IR_DATA_PATH "/ir_data"
 
-WiFiServer server(80);
+byte        irbuffer[BUF_SIZE];
+WiFiServer  server(80);
 
 void setup()
 {
@@ -48,7 +51,7 @@ void loop()
 
   // Read the first line of the request
   String req = client.readStringUntil('\r');
-  Serial.println(req);
+  DBG_OUTPUT_PORT.println(req);
   client.flush();
 
   // Match the request
@@ -104,7 +107,7 @@ void loop()
   // Send the response to the client
   client.print(s);
   delay(1);
-  Serial.println("Client disonnected");
+  DBG_OUTPUT_PORT.println("Client disonnected");
 
   if (val == -3)
     record_ir();
@@ -138,31 +141,73 @@ void setupWiFi()
   WiFi.softAP(AP_NameChar, WiFiAPPSK);
 }
 
+//format bytes
+String formatBytes(size_t bytes){
+  if (bytes < 1024){
+    return String(bytes)+"B";
+  } else if(bytes < (1024 * 1024)){
+    return String(bytes/1024.0)+"KB";
+  } else if(bytes < (1024 * 1024 * 1024)){
+    return String(bytes/1024.0/1024.0)+"MB";
+  } else {
+    return String(bytes/1024.0/1024.0/1024.0)+"GB";
+  }
+}
+
 void initHardware()
 {
-  Serial.begin(115200);
+  DBG_OUTPUT_PORT.begin(115200);
   pinMode(IR_DETECT_PIN, INPUT);
   pinMode(INDICATOR_LED, OUTPUT);
   pinMode(IR_LED, OUTPUT);
   IND_OFF;
   IR_OFF;
+
+  SPIFFS.begin();
+  {
+    Dir dir = SPIFFS.openDir("/");
+    while (dir.next()) {    
+      String fileName = dir.fileName();
+      size_t fileSize = dir.fileSize();
+      DBG_OUTPUT_PORT.printf("FS File: %s, size: %s\n", fileName.c_str(), formatBytes(fileSize).c_str());
+    }
+    DBG_OUTPUT_PORT.printf("\n");
+  }  
 }
 
 void dumpBuff(byte *buf, int len) {
-  Serial.println("\nBuffer :\n");
+  DBG_OUTPUT_PORT.println("\nBuffer :\n");
   for (int i=0; i<len; i++) {
-    Serial.printf("%02x\n", buf[i]);
+    DBG_OUTPUT_PORT.printf("%02x\n", buf[i]);
   }
-  Serial.println("\n--------\n");
+  DBG_OUTPUT_PORT.println("\n--------\n");
 }
 
 void record_ir() {
   IND_ON;
   digitalRecord(IR_DETECT_PIN, SAMPLE_PERIOD, irbuffer, BUF_SIZE);
   IND_OFF;
+
+  // save to SPIFFS
+  File file = SPIFFS.open("/ir_data/test1", "w");
+  if(file) {
+    // write buffer to file
+    file.write(irbuffer, BUF_SIZE);
+    file.close();
+  } else {
+    DBG_OUTPUT_PORT.println("Failed to create file\n");
+  }
 }
 
 void play_ir() {
+  // Load data if there
+  File file = SPIFFS.open("/ir_data/test1", "r");
+  if(file) {
+    // read buffer to file
+    file.readBytes((char*) irbuffer, file.size());
+    file.close();
+  }
+  
   IR_OFF;
   IND_ON;
   digitalPlayInverted(IR_LED, SAMPLE_PERIOD, irbuffer, BUF_SIZE);
