@@ -1,4 +1,5 @@
 #include <ESP8266WiFi.h>
+#include "sampler.h"
 
 //////////////////////
 // WiFi Definitions //
@@ -18,19 +19,15 @@ const int IR_LED        = D3;
 const int IR_DETECT_PIN = D6; 
 const int ANALOG_PIN    = A0; 
 
-uint32_t expire;
-
 #define IR_ON   digitalWrite(IR_LED, HIGH)
 #define IR_OFF  digitalWrite(IR_LED, LOW)
 #define IND_ON  digitalWrite(INDICATOR_LED, HIGH)
 #define IND_OFF digitalWrite(INDICATOR_LED, LOW)
-#define BUF_SIZE  20000
-#define SEQ_SIZE  500
+
+#define BUF_SIZE  2500     // IR Buffer size in Bytes (1 Byte = 800uS, 
+#define SAMPLE_PERIOD  100
 
 byte irbuffer[BUF_SIZE];
-
-int sequence[SEQ_SIZE];
-
 
 WiFiServer server(80);
 
@@ -149,72 +146,27 @@ void initHardware()
   pinMode(IR_LED, OUTPUT);
   IND_OFF;
   IR_OFF;
-  // Don't need to set ANALOG_PIN as input,
-  // that's all it can be.
 }
 
-
-void record_ir2() {
-  
-  byte current;
-  byte sample;
-  byte start;
-  int counter = 0;
-  int seqPtr = 0;
-    
-  sample = (byte) digitalRead(IR_DETECT_PIN);
-  start = sample;
-  current = sample;
-
-  IND_ON;
-  expire = micros();
-  while (seqPtr < SEQ_SIZE) {
-    usDelay(100);
-    if (current != sample) {
-      sequence[seqPtr] = counter;
-      counter = 0;
-    } else {
-      counter++;
-    }
+void dumpBuff(byte *buf, int len) {
+  Serial.println("\nBuffer :\n");
+  for (int i=0; i<len; i++) {
+    Serial.printf("%02x\n", buf[i]);
   }
-  
-  IND_OFF;
+  Serial.println("\n--------\n");
 }
-
 
 void record_ir() {
   IND_ON;
-  expire = micros();
-  for(int i=0; i<BUF_SIZE; i++) {
-    usDelay(100);
-    irbuffer[i] = (byte) digitalRead(IR_DETECT_PIN);
-  }
+  digitalRecord(IR_DETECT_PIN, SAMPLE_PERIOD, irbuffer, BUF_SIZE);
   IND_OFF;
 }
 
 void play_ir() {
   IR_OFF;
   IND_ON;
-  expire = micros();
-  for(int i=0; i<BUF_SIZE; i++) {
-    usDelay(100);
-    if (irbuffer[i] != 0) 
-//      IR_ON;
-      IR_OFF;
-    else
-//      IR_OFF;
-      IR_ON;
-
-    //delay(1);
-  }
+  digitalPlayInverted(IR_LED, SAMPLE_PERIOD, irbuffer, BUF_SIZE);
   IND_OFF;
   IR_OFF;
-}
-
-void usDelay(uint32_t dly) {
-  while (expire > micros()) {
-    yield();  
-  }
-  expire = micros() + dly;
 }
 
