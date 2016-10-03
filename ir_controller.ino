@@ -1,16 +1,10 @@
 #include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include "sampler.h"
 #include <FS.h>
-
-//////////////////////
-// WiFi Definitions //
-// Ht Me on: 
-//  http://192.168.4.1/read
-//  http://192.168.4.1/led/1
-//  http://192.168.4.1/record
-//  http://192.168.4.1/play
-//////////////////////
-const char WiFiAPPSK[] = "sparkfun";
+#include "config.h"
 
 /////////////////////
 // Pin Definitions //
@@ -18,127 +12,157 @@ const char WiFiAPPSK[] = "sparkfun";
 const int INDICATOR_LED = D2; 
 const int IR_LED        = D3; 
 const int IR_DETECT_PIN = D6; 
-const int ANALOG_PIN    = A0; 
 
 #define IR_ON   digitalWrite(IR_LED, HIGH)
 #define IR_OFF  digitalWrite(IR_LED, LOW)
 #define IND_ON  digitalWrite(INDICATOR_LED, HIGH)
 #define IND_OFF digitalWrite(INDICATOR_LED, LOW)
 
-#define BUF_SIZE  2500     // IR Buffer size in Bytes (1 Byte = 800uS, 
-#define SAMPLE_PERIOD  100
+#define MAX_BUF_SIZE   8000     // IR Buffer size in Bytes (1 Byte = 8 samples) 
+#define DFLT_BUF_SIZE  2500
+#define MIN_BUF_SIZE      0
+#define SAMPLE_PERIOD   100     // Sample period in uS
 
 #define DBG_OUTPUT_PORT Serial
-#define IR_DATA_PATH "/ir_data"
+#define IR_DATA_PATH    "/ir_data"
 
-byte        irbuffer[BUF_SIZE];
-WiFiServer  server(80);
+byte irbuffer[MAX_BUF_SIZE];
 
-void setup()
-{
-  initHardware();
-  setupWiFi();
-  server.begin();
+const char WiFiAPPSK[] = WIFI_AP_SECRET;
+const char* ssid       = WIFI_SSID;
+const char* password   = WIFI_PASSWORD;
+const char* host       = HOSTNAME;
+
+ESP8266WebServer server(SERVER_PORT);
+
+void handleRecord() {
+  String path = server.hasArg("path") ? server.arg("path") : "/default";
+  String sampleDuration = server.hasArg("duration") ? server.arg("duration") : "2000";
+  int bufSize = (sampleDuration.toInt() * 10) / 8;
+
+  if (bufSize < MIN_BUF_SIZE)
+    bufSize = DFLT_BUF_SIZE; 
+    
+  if (bufSize > MAX_BUF_SIZE)
+    bufSize = MAX_BUF_SIZE; 
+
+  DBG_OUTPUT_PORT.println(sampleDuration);
+  DBG_OUTPUT_PORT.printf(" Save buffer size of %d\n", bufSize);
+  
+  IND_ON;
+  digitalRecord(IR_DETECT_PIN, SAMPLE_PERIOD, irbuffer, bufSize);
+  IND_OFF;
+
+  // save to SPIFFS
+  File file = SPIFFS.open(path, "w");
+  if(file) {
+    // write buffer to file
+    file.write(irbuffer, bufSize);
+    file.close();
+  } else {
+    DBG_OUTPUT_PORT.println("Failed to create file\n");
+  }
+  
+  server.send(200, "text/json", "OK");
 }
 
-void loop()
-{
-  // Check if a client has connected
-  WiFiClient client = server.available();
-  if (!client) {
-    return;
+void handlePlay() {
+  String path = server.hasArg("path") ? server.arg("path") : "/default";
+  int bufSize = 0;
+  
+  // Load data if there
+  File file = SPIFFS.open(path, "r");
+  if(file) {
+    // read buffer to file
+    bufSize = file.size();
+    file.readBytes((char*) irbuffer, bufSize);
+    file.close();
   }
+  
+  IR_OFF;
+  IND_ON;
+  digitalPlayInverted(IR_LED, SAMPLE_PERIOD, irbuffer, bufSize);
+  IND_OFF;
+  IR_OFF;  
+  
+  server.send(200, "text/json", "OK");
+}
 
-  // Read the first line of the request
-  String req = client.readStringUntil('\r');
-  DBG_OUTPUT_PORT.println(req);
-  client.flush();
+void handleList() {
+  String path = server.hasArg("path") ? server.arg("path") : "";
+  
+  DBG_OUTPUT_PORT.println("handleFileList: " + path);
+  Dir dir = SPIFFS.openDir(path);
+  path = String();
 
-  // Match the request
-  int val = -1; // We'll use 'val' to keep track of both the
-  // request type (read/set) and value if set.
-  if (req.indexOf("/led/0") != -1)
-    val = 0; // Will write LED low
-  else if (req.indexOf("/led/1") != -1)
-    val = 1; // Will write LED high
-  else if (req.indexOf("/read") != -1)
-    val = -2; // Will print pin reads
-  else if (req.indexOf("/record") != -1)
-    val = -3; // Will print pin reads
-  else if (req.indexOf("/play") != -1)
-    val = -4; // Will print pin reads
-  // Otherwise request will be invalid. We'll say as much in HTML
-
-  // Set GPIO5 according to the request
-  if (val == 0) {
-    IND_OFF;
-    IR_OFF;
-  } else if (val == 1) {
-    IND_ON;
-    IR_ON;
+  String output = "[";
+  while(dir.next()){
+    File entry = dir.openFile("r");
+    if (output != "[") output += ',';
+    bool isDir = false;
+    output += "{\"type\":\"";
+    output += (isDir)?"dir":"file";
+    output += "\",\"name\":\"";
+    output += String(entry.name()).substring(1);
+    output += "\"}";
+    entry.close();
   }
-    
-  client.flush();
+  
+  output += "]";
+  server.send(200, "text/json", output);
+}
 
-  // Prepare the response. Start with the common header:
-  String s = "HTTP/1.1 200 OK\r\n";
-  s += "Content-Type: text/html\r\n\r\n";
-  s += "<!DOCTYPE HTML>\r\n<html>\r\n";
-  // If we're setting the LED, print out a message saying we did
-  if (val >= 0)
-  {
-    s += "LED is now ";
-    s += (val) ? "on" : "off";
+void handleClear() {
+  String path = server.hasArg("path") ? server.arg("path") : "dummy";
+  
+  DBG_OUTPUT_PORT.println("handleClear: " + path);
+  Dir dir = SPIFFS.openDir(path);
+  path = String();
+
+  String output = "[";
+  while(dir.next()) {
+    SPIFFS.remove(dir.fileName());
+    output += "\"";
+    output += String(dir.fileName());
+    output += "\",";
   }
-  else if (val == -2)
-  { // If we're reading pins, print out those values:
-    s += "Analog Pin = ";
-    s += String(analogRead(ANALOG_PIN));
-    s += "<br>"; // Go to the next line.
-    s += "Digital Pin 12 = ";
-    s += String(digitalRead(IR_DETECT_PIN));
-  }
-  else
-  {
-    s += "Invalid Request.<br> Try /led/1, /led/0, or /read.";
-  }
-  s += "</html>\n";
-
-  // Send the response to the client
-  client.print(s);
-  delay(1);
-  DBG_OUTPUT_PORT.println("Client disonnected");
-
-  if (val == -3)
-    record_ir();
-
-  if (val == -4)
-    play_ir();
-
-  // The client will actually be disconnected
-  // when the function returns and 'client' object is detroyed
+  
+  output += "]";
+  server.send(200, "text/json", output);
 }
 
 void setupWiFi()
 {
-  WiFi.mode(WIFI_AP);
+  //WIFI INIT
+  WiFi.mode(WIFI_STA);
+  delay(300);
+  DBG_OUTPUT_PORT.printf("Connecting to %s\n", ssid);
+  if (String(WiFi.SSID()) != String(ssid)) {
+    WiFi.begin(ssid, password);
+  }
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    DBG_OUTPUT_PORT.print(".");
+  }
+  DBG_OUTPUT_PORT.println("");
+  DBG_OUTPUT_PORT.print("Connected! IP address: ");
+  DBG_OUTPUT_PORT.println(WiFi.localIP());
 
-  // Do a little work to get a unique-ish name. Append the
-  // last two bytes of the MAC (HEX'd) to "Thing-":
-  uint8_t mac[WL_MAC_ADDR_LENGTH];
-  WiFi.softAPmacAddress(mac);
-  String macID = String(mac[WL_MAC_ADDR_LENGTH - 2], HEX) +
-                 String(mac[WL_MAC_ADDR_LENGTH - 1], HEX);
-  macID.toUpperCase();
-  String AP_NameString = "ESP8266 Thing " + macID;
+  MDNS.begin(host);
+  DBG_OUTPUT_PORT.print("Open http://");
+  DBG_OUTPUT_PORT.print(host);
+  DBG_OUTPUT_PORT.println(".local/edit to see the file browser");
 
-  char AP_NameChar[AP_NameString.length() + 1];
-  memset(AP_NameChar, 0, AP_NameString.length() + 1);
-
-  for (int i = 0; i < AP_NameString.length(); i++)
-    AP_NameChar[i] = AP_NameString.charAt(i);
-
-  WiFi.softAP(AP_NameChar, WiFiAPPSK);
+  server.on("/list",   HTTP_GET, handleList);
+  server.on("/record", HTTP_GET, handleRecord);
+  server.on("/play",   HTTP_GET, handlePlay);
+  server.on("/clear",  HTTP_GET, handleClear);
+  server.onNotFound([](){
+      server.send(404, "text/plain", "FileNotFound");
+  });
+  server.begin();
+  DBG_OUTPUT_PORT.println("HTTP server started");
 }
 
 //format bytes
@@ -183,35 +207,15 @@ void dumpBuff(byte *buf, int len) {
   DBG_OUTPUT_PORT.println("\n--------\n");
 }
 
-void record_ir() {
-  IND_ON;
-  digitalRecord(IR_DETECT_PIN, SAMPLE_PERIOD, irbuffer, BUF_SIZE);
-  IND_OFF;
-
-  // save to SPIFFS
-  File file = SPIFFS.open("/ir_data/test1", "w");
-  if(file) {
-    // write buffer to file
-    file.write(irbuffer, BUF_SIZE);
-    file.close();
-  } else {
-    DBG_OUTPUT_PORT.println("Failed to create file\n");
-  }
+void setup()
+{
+  initHardware();
+  setupWiFi();
+  //server.begin();
 }
 
-void play_ir() {
-  // Load data if there
-  File file = SPIFFS.open("/ir_data/test1", "r");
-  if(file) {
-    // read buffer to file
-    file.readBytes((char*) irbuffer, file.size());
-    file.close();
-  }
-  
-  IR_OFF;
-  IND_ON;
-  digitalPlayInverted(IR_LED, SAMPLE_PERIOD, irbuffer, BUF_SIZE);
-  IND_OFF;
-  IR_OFF;
+void loop()
+{
+  server.handleClient();
 }
 
